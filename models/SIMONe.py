@@ -1,53 +1,11 @@
 import os
 import torch
+import einops
+import networks
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
-import numpy as np
-import matplotlib.pyplot as plt
-import einops
-from .position_encoding import PositionalEncoding3D
-
-def ConvNet(
-    num_layers, in_channels, mid_channels, out_channels, kernel=4, stride=2, padding=1,
-    dim=2
-):
-    layers = []
-    if dim == 1:
-        net = nn.Conv1d
-    elif dim == 2:
-        net = nn.Conv2d
-
-    for i in range(int(num_layers)):
-        if i == 0:
-            conv = net(
-                in_channels,
-                mid_channels,
-                kernel_size=kernel,
-                stride=stride,
-                padding=padding,
-            )
-        elif i == num_layers - 1:
-            conv = net(
-                mid_channels,
-                out_channels,
-                kernel_size=kernel,
-                stride=stride,
-                padding=padding,
-            )
-        else:
-            conv = net(
-                mid_channels,
-                mid_channels,
-                kernel_size=kernel,
-                stride=stride,
-                padding=padding,
-            )
-        layers.append(conv)
-        layers.append(nn.ReLU())
-
-    convnet = nn.Sequential(*layers)
-    return convnet
 
 
 class SIMONE(nn.Module):
@@ -88,11 +46,11 @@ class SIMONE(nn.Module):
         self.I, self.J = 8, 8  # size of output feature map for each frame
 
         # CNN Outputs 8*8 feature map for each frame
-        self.position_embedding1 = PositionalEncoding3D(128)
-        self.position_embedding2 = PositionalEncoding3D(128)
+        self.position_embedding1 = networks.PositionalEncoding3D(128)
+        self.position_embedding2 = networks.PositionalEncoding3D(128)
 
         n_layers = np.log2(W / 8)
-        self.cnn_encoder = ConvNet(
+        self.cnn_encoder = networks.ConvNet(
             n_layers, C, cnn_encoder_hidden_dim, cnn_encoder_hidden_dim
         )  # Output should be B x T x C x 8 x 8
 
@@ -136,8 +94,8 @@ class SIMONE(nn.Module):
             nn.Linear(256, 128)
         )
 
-        self.decoder = ConvNet(4, H + 3, 128, 4, kernel=1,
-                               stride=1, padding=0, dim=1)
+        self.decoder = networks.ConvNet(4, H + 3, 128, 4, kernel=1,
+                                        stride=1, padding=0, dim=1)
         self.layer_norm = nn.LayerNorm((T, H, W, K_slots, 1))
 
         self.recon_alpha = recon_alpha
@@ -146,7 +104,6 @@ class SIMONE(nn.Module):
         self.pixel_std = torch.tensor(pixel_std).to(device)
 
         self.device = device
-
 
     def encode(self, x):
         """ Encodes sequence of images into frame and object latents
@@ -169,21 +126,22 @@ class SIMONE(nn.Module):
             frames.append(frame_encoding)
 
         frames = torch.stack(frames, dim=1)
-        frames = frames.permute((0, 1, 3, 4, 2)) # (B, T, I, J, C)
+        frames = frames.permute((0, 1, 3, 4, 2))  # (B, T, I, J, C)
         B, T, I, J, C = frames.shape
 
         frames_emb = self.position_embedding1(frames)
         frames = frames + frames_emb
 
-        conv_frames_shape = frames.shape
-        flattened_frames = torch.flatten(frames, start_dim=1, end_dim=-2) # (B, T * I * J, C)
+        flattened_frames = torch.flatten(
+            frames, start_dim=1, end_dim=-2)  # (B, T * I * J, C)
         x = self.transformer_1(flattened_frames)
 
         # Reshape and spatial pool
-        x = x.reshape(B, T, self.I, self.J, -1).permute((0, 1, 4, 2, 3)) # (B, T, C, I, J)
+        x = x.reshape(B, T, self.I, self.J, -
+                      1).permute((0, 1, 4, 2, 3))  # (B, T, C, I, J)
         if self.K_slots < self.I * self.J:
-            x = self.spatial_pool(x) # (B, T, C, I // 2, J // 2)
-            x = x.permute((0, 1, 3, 4, 2)) # (B, T, I, J, C)
+            x = self.spatial_pool(x)  # (B, T, C, I // 2, J // 2)
+            x = x.permute((0, 1, 3, 4, 2))  # (B, T, I, J, C)
 
         x_emb = self.position_embedding2(x)
         x = x + x_emb
@@ -191,7 +149,7 @@ class SIMONE(nn.Module):
         B, T, I, J, C = x.shape
         K = I * J
 
-        x = torch.flatten(x, start_dim=1, end_dim=-2) # (B, T * I * J, C)
+        x = torch.flatten(x, start_dim=1, end_dim=-2)  # (B, T * I * J, C)
         x = self.transformer_2(x)
         x = x.reshape(B, T, K, C)
 
@@ -202,7 +160,6 @@ class SIMONE(nn.Module):
         lambda_frame = self.lambda_frame_mlp(spatial_mean)
 
         return lambda_obj, lambda_frame
-
 
     def reparameterize(self, dist, broadcast=""):
         """ Draws samples from unit spherical Guassian
@@ -232,7 +189,6 @@ class SIMONE(nn.Module):
 
         return latents
 
-
     def decode(self, object_dists, frame_dists, batch_size):
         """ Decodes pixel means and Gaussian mixture logits given
             object and frame means and log vars. Samples independent
@@ -261,7 +217,8 @@ class SIMONE(nn.Module):
 
         # Stack spatial coordinates and repeat across batch and time
         spatial_coords = torch.linspace(-1, 1, H)
-        xv, yv = torch.meshgrid([spatial_coords, spatial_coords], indexing="xy")
+        xv, yv = torch.meshgrid(
+            [spatial_coords, spatial_coords], indexing="xy")
         ll = torch.stack([xv, yv], -1)
         decode_idxs = einops.repeat(ll, "H W X -> B T H W X", B=B, T=T)
 
@@ -303,11 +260,14 @@ class SIMONE(nn.Module):
 
         # Normalize and take softmax over object dim of logits
         pre_mixture_logits = self.layer_norm(pre_mixture_logits)
-        mixture_logits = F.softmax(pre_mixture_logits, -2).squeeze(-1)  # (B, T, H, W, K)
+        mixture_logits = F.softmax(
+            pre_mixture_logits, -2).squeeze(-1)  # (B, T, H, W, K)
 
         # Create gaussian mixture model
+        # TODO: Not sure this is correct mixture model
         mix = D.Categorical(mixture_logits)
-        components = D.Independent(D.Normal(pixel_means, torch.ones_like(pixel_means) * self.pixel_std), 1)
+        components = D.Independent(
+            D.Normal(pixel_means, torch.ones_like(pixel_means) * self.pixel_std), 1)
         pixel_dists = D.mixture_same_family.MixtureSameFamily(mix, components)
 
         # sample reconstructions
@@ -341,7 +301,8 @@ class SIMONE(nn.Module):
             (self.frame_kl_beta / frame_mean.shape[1])
 
         log_prob = torch.sum(mixture.log_prob(inputs.reshape(B, T, H, W, C)))
-        total_loss = -1 * ( self.recon_alpha * log_prob / (T * H * W * C)) + obj_kl + frame_kl
+        total_loss = -1 * (self.recon_alpha * log_prob /
+                           (T * H * W * C)) + obj_kl + frame_kl
 
         return {"total_loss": total_loss,
                 "obj_kl_loss": obj_kl,
@@ -361,8 +322,7 @@ if __name__ == "__main__":
         print(losses["total_loss"].item())
         optim.step()
 
-    from ..utils import make_video
-    make_video([img.detach().cpu().numpy(), out["recons"].detach().cpu().numpy()],
-               titles=["ground truth", "reconstruction"],
-               output_name="simone_overfit_test_1")
-
+    # from utils import make_video
+    # make_video([img.detach().cpu().numpy(), out["recons"].detach().cpu().numpy()],
+    #            titles=["ground truth", "reconstruction"],
+    #            output_name="simone_overfit_test_1")

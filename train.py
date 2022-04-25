@@ -2,72 +2,19 @@ import os
 import glob
 import time
 import torch
-import metrics
 import numpy as np
+import torch.nn as nn
 import torch.nn.functional as F
 
-from models import SIMONe
 from data import gestalt
+from utils import metrics
+from models import SIMONe
+from models import SlotAttentionModels
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from tqdm import tqdm
 from argparse import ArgumentParser
-
-parser = ArgumentParser()
-
-# Model params
-
-# Data params
-parser.add_argument("--num_frames", type=int, default=16, help="Frames to train on")
-parser.add_argument("--batch_size", type=int, default=4, help="Batch Size")
-
-# Training params
-parser.add_argument("--lr", type=float, default=1e-4, help="Learning Rate")
-parser.add_argument("--warmup_steps", type=int, default=2500, help="Warmup steps for learning rate")
-parser.add_argument("--grad_clip", type=float, default=0.05, help="Gradient Clipping")
-parser.add_argument(
-    "--train_iters", type=int, default=50e4, help="Number of training steps"
-)
-parser.add_argument("--log_every", type=int, default=10, help="How often to log losses")
-parser.add_argument(
-    "--eval_every", type=int, default=1000, help="How often to run eval"
-)
-parser.add_argument("--seed", type=int, default=42, help="random seed")
-parser.add_argument("--multi-gpu", action="store_true", help="Use multiple GPUs")
-
-# Paths
-parser.add_argument(
-    "--plot_n_videos", type=int, default=4, help="Number of videos to plot"
-)
-parser.add_argument(
-    "--log_dir", type=str, default="/om2/user/yyf/GestaltVision/runs/SIMONe/batch_size=1_frames=10"
-)
-parser.add_argument(
-    "--checkpoint_dir", type=str, default="/om2/user/yyf/GestaltVision/models/SIMONe/batch_size=1_frames=10"
-)
-parser.add_argument("--data_dir", type=str, default="/om/user/yyf/CommonFate/scenes")
-parser.add_argument(
-    "--top_level",
-    type=str,
-    nargs="+",
-    default=["voronoi", "noise"],
-    help="texture split",
-)
-parser.add_argument(
-    "--sub_level",
-    type=str,
-    nargs="+",
-    default=["superquadric_1", "superquadric_2", "superquadric_3"],
-    help="object split",
-)
-
-parser.add_argument(
-    "--load_latest_model",
-    action="store_true",
-    help="Continue training from latest checkpoint",
-)
-args = parser.parse_args()
 
 
 def learning_rate_update(optim, step, warmup_steps, max_lr, max_steps):
@@ -100,6 +47,7 @@ def learning_rate_update(optim, step, warmup_steps, max_lr, max_steps):
 
     return lr
 
+
 def eval(model, data_loader, args, step, writer=None, save=True):
     """
     Runs eval loop on set set of data, logs results to tensorboard
@@ -126,7 +74,8 @@ def eval(model, data_loader, args, step, writer=None, save=True):
             images = batch["images"]
             flows = batch["flows"]
             if args.cue == "masks":
-                cue = batch[args.cue][:, :, 0]  # Only take first time step of a cue
+                # Only take first time step of a cue
+                cue = batch[args.cue][:, :, 0]
             else:
                 cue = batch[args.cue][:, 0]
             out = model(images, cues=cue)
@@ -141,9 +90,12 @@ def eval(model, data_loader, args, step, writer=None, save=True):
             gt_masks = gt_masks.reshape((B, N, T, H, W, C))
             pred_masks = pred_masks.transpose(1, 2)
 
-            pred_groups = pred_masks.reshape(args.batch_size, N, -1).permute(0, 2, 1)
-            true_groups = gt_masks.reshape(args.batch_size, N, -1).permute(0, 2, 1)
-            fg_ari += metrics.adjusted_rand_index(true_groups, pred_groups).mean()
+            pred_groups = pred_masks.reshape(
+                args.batch_size, N, -1).permute(0, 2, 1)
+            true_groups = gt_masks.reshape(
+                args.batch_size, N, -1).permute(0, 2, 1)
+            fg_ari += metrics.adjusted_rand_index(
+                true_groups, pred_groups).mean()
 
             gt_masks = gt_masks[:, 1:, ...].sum(
                 dim=1
@@ -164,12 +116,17 @@ def eval(model, data_loader, args, step, writer=None, save=True):
             writer.add_scalar("eval/fg_ari", fg_ari, step)
             writer.add_scalar("eval/mean_IOU", mean_IOU, step)
 
-            writer.add_video("eval/input_video", images[: args.plot_n_videos], step)
-            writer.add_video("eval/pred_flow", pred_flows[: args.plot_n_videos], step)
+            writer.add_video("eval/input_video",
+                             images[: args.plot_n_videos], step)
+            writer.add_video("eval/pred_flow",
+                             pred_flows[: args.plot_n_videos], step)
             writer.add_video("eval/gt_flow", flows[: args.plot_n_videos], step)
-            writer.add_video("eval/pred_masks", pred_masks[: args.plot_n_videos], step)
-            writer.add_video("eval/gt_masks", gt_masks[: args.plot_n_videos], step)
-            writer.add_video("eval/slot_recons", recons[: args.plot_n_videos], step)
+            writer.add_video("eval/pred_masks",
+                             pred_masks[: args.plot_n_videos], step)
+            writer.add_video(
+                "eval/gt_masks", gt_masks[: args.plot_n_videos], step)
+            writer.add_video("eval/slot_recons",
+                             recons[: args.plot_n_videos], step)
 
         print("=" * 30 + " EVALUATION " + "=" * 30)
         print("Step: {}, Eval Loss: {}".format(step, i, loss))
@@ -183,6 +140,7 @@ def eval(model, data_loader, args, step, writer=None, save=True):
 
 def train(model, data_loader, args, step=0):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     def train_step(batch, model, optim):
         optim.zero_grad()
         images = batch["images"].to(device)
@@ -200,17 +158,18 @@ def train(model, data_loader, args, step=0):
     writer = SummaryWriter(args.log_dir)
 
     prof = torch.profiler.profile(
-                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(args.log_dir),
-                record_shapes=True,
-                with_stack=True
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(args.log_dir),
+        record_shapes=True,
+        with_stack=True
     )
     prof.start()
 
     while step < args.train_iters:
 
         for i, batch in enumerate(tqdm(data_loader)):
-            lr = learning_rate_update(optim, step, args.warmup_steps, args.lr, args.train_iters)
+            lr = learning_rate_update(
+                optim, step, args.warmup_steps, args.lr, args.train_iters)
             out, losses = train_step(batch, model, optim)
             if i % args.log_every == 0:
                 recons = out["recons"].detach().cpu().numpy()
@@ -236,12 +195,14 @@ def train(model, data_loader, args, step=0):
             if step % args.eval_every == 0 and step > 0:
                 # eval(model, data_loader, args, step, writer)
 
-                checkpoint = {"model": model.state_dict(), "optim": optim, "step": step}
+                checkpoint = {"model": model.state_dict(),
+                              "optim": optim, "step": step}
                 if not os.path.exists(args.checkpoint_dir):
                     os.makedirs(args.checkpoint_dir, exist_ok=True)
                 torch.save(
                     checkpoint,
-                    os.path.join(args.checkpoint_dir, "checkpoint_{}.pth".format(step)),
+                    os.path.join(args.checkpoint_dir,
+                                 "checkpoint_{}.pth".format(step)),
                 )
 
             step += 1
@@ -266,7 +227,71 @@ def load_latest(args):
     checkpoints.sort()
     return torch.load(checkpoints[-1])
 
+
 if __name__ == "__main__":
+    parser = ArgumentParser()
+
+    # Model params
+    parser.add_argument("--model", type=str,
+                        default="SIMONE", help="SIMONE or SAVI")
+
+    # Data params
+    parser.add_argument("--num_frames", type=int, default=16,
+                        help="Frames to train on")
+
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch Size")
+
+    # Training params
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning Rate")
+    parser.add_argument("--warmup_steps", type=int, default=2500,
+                        help="Warmup steps for learning rate")
+    parser.add_argument("--grad_clip", type=float,
+                        default=0.05, help="Gradient Clipping")
+    parser.add_argument(
+        "--train_iters", type=int, default=50e4, help="Number of training steps"
+    )
+    parser.add_argument("--log_every", type=int, default=10,
+                        help="How often to log losses")
+    parser.add_argument(
+        "--eval_every", type=int, default=1000, help="How often to run eval"
+    )
+    parser.add_argument("--seed", type=int, default=42, help="random seed")
+    parser.add_argument("--multi-gpu", action="store_true",
+                        help="Use multiple GPUs")
+
+    # Paths
+    parser.add_argument(
+        "--plot_n_videos", type=int, default=4, help="Number of videos to plot"
+    )
+    parser.add_argument(
+        "--log_dir", type=str, default="/om2/user/yyf/GestaltVision/runs/SIMONe/batch_size=1_frames=10"
+    )
+    parser.add_argument(
+        "--checkpoint_dir", type=str, default="/om2/user/yyf/GestaltVision/models/SIMONe/batch_size=1_frames=10"
+    )
+    parser.add_argument("--data_dir", type=str,
+                        default="/om/user/yyf/CommonFate/scenes")
+    parser.add_argument(
+        "--top_level",
+        type=str,
+        nargs="+",
+        default=["voronoi", "noise"],
+        help="texture split",
+    )
+    parser.add_argument(
+        "--sub_level",
+        type=str,
+        nargs="+",
+        default=["superquadric_1", "superquadric_2", "superquadric_3"],
+        help="object split",
+    )
+
+    parser.add_argument(
+        "--load_latest_model",
+        action="store_true",
+        help="Continue training from latest checkpoint",
+    )
+    args = parser.parse_args()
 
     dataloader = DataLoader(
         gestalt.Gestalt(
@@ -283,7 +308,11 @@ if __name__ == "__main__":
 
     ex = next(iter(dataloader))["images"]
     print(ex.shape)
-    model = SIMONe.SIMONE(ex.shape, 128)
+
+    if args.model == "SIMONE":
+        model = SIMONe.SIMONE(ex.shape, 128)
+    elif args.model == "SAVI":
+        model = SlotAttentionModels.SAVi()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.multi_gpu:
