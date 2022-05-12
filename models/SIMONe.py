@@ -1,7 +1,7 @@
 import os
 import torch
 import einops as E
-from models import networks
+import networks
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,33 +23,30 @@ class Encoder(nn.Module):
 
         # Number of layers in conv net is dependent on resolution
         num_layers = np.log2(w / 8)
-        self.ConvBlock = networks.ConvNet(num_layers,
-                                          in_channels=c,
-                                          mid_channels=feature_dim,
-                                          out_channels=feature_dim)
+        self.ConvBlock = networks.ConvNet(
+            num_layers,
+            in_channels=c,
+            mid_channels=feature_dim,
+            out_channels=feature_dim,
+        )
 
-        self.position_embedding = networks.PositionalEncodingPermute3D(128)
+        self.position_encoding_1 = networks.PositionalEncodingPermute3D(128)
+        self.position_encoding_2 = networks.PositionalEncodingPermute3D(128)
+
         transformer_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=feature_dim,
-            nhead=4,
-            dim_feedforward=1024,
-            dropout=0.0,
+            d_model=feature_dim, nhead=4, dim_feedforward=1024, dropout=0.0,
         )
         self.transformerA = nn.TransformerEncoder(transformer_encoder_layer, 4)
         self.transformerB = nn.TransformerEncoder(transformer_encoder_layer, 4)
 
         # MLP from objects --> frames
         self.lambda_frame_mlp = nn.Sequential(
-            nn.Linear(128, 256),
-            nn.SiLU(),
-            nn.Linear(256, 128)
+            nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, 128)
         )
 
         # MLP from frames --> objects
         self.lambda_obj_mlp = nn.Sequential(
-            nn.Linear(128, 256),
-            nn.SiLU(),
-            nn.Linear(256, 128)
+            nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, 128)
         )
 
     def forward(self, x):
@@ -61,28 +58,34 @@ class Encoder(nn.Module):
 
         # output of conv encoder should be b, t, 128, 8, 8
         z = self.ConvBlock(x)
-        z = E.rearrange(z, "(b t) c h w -> b t c h w", t=t)
+        z = E.rearrange(z, "(b t) c h w -> b t h w c", t=t)
 
-        _, _, z_c, z_h, z_w = z.shape
-        z = self.position_embedding(z)
+        _, _, z_h, z_w, z_c = z.shape
+        z = self.position_encoding_1(z)
 
         # reshape for transformer
-        z = E.rearrange(z, "b t c h w -> b (t h w) c")
+        z = E.rearrange(z, "b t z_h z_w z_c -> b (t z_h z_w) z_c")
 
         z = self.transformerA(z)
-        z = E.rearrange(z, "b (t h w) c -> b t h w c", t=t,
-                        h=z_h, w=z_w)   # expand for pooling
+        z = E.rearrange(
+            z, "b (t z_h z_w) z_c -> (b t) z_c z_h z_w", t=t, z_h=z_h, z_w=z_w
+        )  # expand for pooling
+
+        z = F.avg_pool2d(z, kernel_size=2) * 2
 
         # Sum Pooling then scale to get K slots
-        z = E.reduce(z, "b t (i h) (j w) c -> b t i j c", "sum", h=2, w=2)
-        z = z / 2  # 16 / (8*8) = 1/2
+        # z = E.reduce(z, "b t (i h) (j w) c -> b t i j c", "sum", h=2, w=2)
+        # z = z / 2  # 16 / (8*8) = 1/2
 
         # reshape for second transformer
-        z = E.rearrange(z, "b t i j c -> b (t i j) c", t=t)
+        z = E.rearrange(z, "(b t) z_c z_h z_w -> b t z_h z_w z_c", t=t)
+        z = self.position_encoding_2(z)
+        z = E.rearrange(z, "b t z_h z_w z_c -> b (t z_h z_w) z_c")
 
         z = self.transformerB(z)
-        z = E.rearrange(z, "b (t k) c -> b k t c", t=t,
-                        k=self.num_slots)  # NOTE: reverse K<->T
+        z = E.rearrange(
+            z, "b (t k) z_c -> b k t z_c", t=t, k=self.num_slots
+        )  # NOTE: reverse K<->T
 
         obj_mean = z.mean(dim=2)  # object mean is taken across frames
         frame_mean = z.mean(dim=1)  # frame mean is taken across objects
@@ -103,7 +106,7 @@ class SIMONE(nn.Module):
         obj_kl_beta=1e-4,
         frame_kl_beta=1e-4,
         pixel_std=0.08,
-        device="cuda"
+        device="cuda",
     ):
         """
         SIMONe model
@@ -119,9 +122,13 @@ class SIMONE(nn.Module):
         self.K_slots = K_slots
         self.z_dim = z_dim
         self.encoder = Encoder(input_size, z_dim=z_dim)
-        self.decoder = networks.ConvNet(num_layers=4, in_channels=h + 3, mid_channels=128, out_channels=4,
-                                        kernel=1, stride=1, padding=0, dim=2)
-        self.layer_norm = nn.LayerNorm((t, h, w, K_slots, 1))
+        self.decoder = networks.MLP(
+            in_features=self.z_dim * 2 + 3,
+            n_layers=3,
+            intermediate_size=256,
+            out_features=4,
+        )
+        self.layer_norm = nn.LayerNorm((t, K_slots, h, w))
 
         self.recon_alpha = recon_alpha
         self.obj_kl_beta = obj_kl_beta
@@ -143,18 +150,24 @@ class SIMONE(nn.Module):
                 Means of object and frame latents
         """
         b, t, c, h, w = x.shape
-        obj_params, frame_params = self.encoder(x)
+        obj_latents, frame_latents = self.encoder(
+            x
+        )  # params are (b, k, c * 2) and (b, t, c * 2)
 
-        # sample from latents
+        obj_params = E.repeat(obj_latents, "b k c -> b t k h w c", t=t, h=h, w=w)
+        frame_params = E.repeat(
+            frame_latents, "b t c -> b t k h w c", k=self.K_slots, h=h, w=w
+        )
+
+        # split distributions into mean and std
         obj_means, obj_stds = torch.split(obj_params, self.z_dim, -1)
         frame_means, frame_stds = torch.split(frame_params, self.z_dim, -1)
 
-        obj_dist = D.Independent(D.Normal(
-            obj_means, torch.exp(obj_stds)), 1)
-        frame_dist = D.Independent(D.Normal(
-            frame_means, torch.exp(frame_stds)), 1)
+        # create normal distributions
+        obj_dist = D.Normal(obj_means, torch.exp(obj_stds))
+        frame_dist = D.Normal(frame_means, torch.exp(frame_stds))
 
-        return obj_dist, frame_dist
+        return obj_dist, frame_dist, obj_latents, frame_latents
 
     def decode(self, obj_posterior, frame_posterior, batch_size):
         """ Decodes pixel means and Gaussian mixture logits given
@@ -174,13 +187,10 @@ class SIMONE(nn.Module):
         b, t, c, h, w = batch_size
 
         # Sample latents
-        obj_latents = obj_posterior.rsample((t, h, w))
-        frame_latents = frame_posterior.rsample((self.K_slots, h, w))
+        obj_latents = obj_posterior.rsample()  # b t k h w c
+        frame_latents = frame_posterior.rsample()  # b t k h w c
 
         # Keep channels last for ease of concatenating inputs
-        obj_latents = E.rearrange(obj_latents, "t h w b k c -> b k t h w c")
-        frame_latents = E.rearrange(
-            frame_latents, "k h w b t c -> b k t h w c")
 
         # Construct spatial coordinate map
         xs = torch.linspace(-1, 1, h)
@@ -188,77 +198,122 @@ class SIMONE(nn.Module):
         xb, yb = torch.meshgrid(xs, ys, indexing="ij")
         _coord_map = torch.stack([xb, yb])
         spatial_coords = E.repeat(
-            _coord_map, "c h w -> b k t h w c", b=b, k=self.K_slots, t=t
+            _coord_map, "c h w -> b t k h w c", b=b, k=self.K_slots, t=t
         )
 
         # Construct temporal map
-        temporal_coords = E.repeat(torch.arange(
-            0, t), "t -> b k t h w 1", b=b, k=self.K_slots, h=h, w=w)
+        temporal_coords = E.repeat(
+            torch.arange(0, t), "t -> b t k h w 1", b=b, k=self.K_slots, h=h, w=w
+        )
 
         # inputs consist of concatenated object and frame latents as well as
         # a spatial coordinate map (ie; broadcast decoder) and temporal coordinates
-        latents = torch.cat([obj_latents, frame_latents,
-                             spatial_coords, temporal_coords], axis=-1)
-        latents = E.rearrange(latents, "b k t h w c -> (b k t) c h w")
+        latents = torch.cat(
+            [obj_latents, frame_latents, spatial_coords, temporal_coords], axis=-1
+        )
+        latents = E.rearrange(latents, "b t k h w c -> (b t k h w) c")
 
         x_recon_masks = self.decoder(latents)
-        x_recon = torch.sigmoid(x_recon_masks[:, :3, :])
-        x_masks = F.softmax(x_recon_masks[:, 3:, :], dim=1)
-        x_recon = E.rearrange(
-            x_recon, "(b k t) c h w -> b k t c h w", b=b, k=self.K_slots, t=t)
-        x_masks = E.rearrange(
-            x_masks, "(b k t) c h w -> b k t c h w", b=b, k=self.K_slots, t=t)
+        x_recon_masks = E.rearrange(
+            x_recon_masks,
+            "(b t k h w) c -> b t k h w c",
+            t=t,
+            k=self.K_slots,
+            h=h,
+            w=w,
+            c=4,
+        )
 
-        return x_recon, x_masks
+        pixels = x_recon_masks[..., :3]
+        weights = x_recon_masks[..., 3]
+
+        weights = F.layer_norm(weights, (t, self.K_slots, h, w))
+        weights_softmax = F.softmax(weights, dim=2)
+
+        weighted_pixels = (pixels * weights_softmax.unsqueeze(-1)).sum(dim=2)
+
+        return pixels, weights, weights_softmax, weighted_pixels
 
     def forward(self, x, decode_idxs=None):
         b, t, c, h, w = x.shape
-        obj_posterior, frame_posterior = self.encode(x)
+        obj_posterior, frame_posterior, obj_latents, frame_latents = self.encode(x)
 
-        x_recon, x_masks = self.decode(
-            obj_posterior, frame_posterior, (b, t, c, h, w))
+        pixels, weights, weights_softmax, weighted_pixels = self.decode(
+            obj_posterior, frame_posterior, (b, t, c, h, w)
+        )
 
         # Mixture over masks and pixel reconstructions
-        x_recon_full = torch.sum(x_recon * x_masks, axis=1)  # sum over slots
-        print("recon: ", x_recon.shape)
-        print("masks: ", x_masks.shape)
-        print("recon full: ", x_recon_full.shape)
+        pixel_likelihood = self.pixel_likelihood_loss(pixels, x, weights_softmax)
+        obj_latent_loss, frame_latent_loss = self.latent_kl_loss(
+            obj_latents, frame_latents
+        )
 
-        # Compute Negative log likelihood of slot distributions given image
-        p_x = D.Independent(D.Normal(
-            x_recon_full, torch.ones_like(x_recon_full) * self.pixel_std), 1)
-        nll = -p_x.log_prob(x).mean()
+        pixel_likelihood = pixel_likelihood.mean()
+        obj_latent_loss = obj_latent_loss.mean()
+        frame_latent_loss = frame_latent_loss.mean()
 
-        # KL Divergence for frame and object priors against normal gaussian (N(0, 1))
-        obj_prior = D.Independent(D.Normal(
-            torch.zeros_like(obj_posterior.base_dist.loc),
-            torch.ones_like(obj_posterior.base_dist.scale),
-        ), 1)
-        object_kl = D.kl.kl_divergence(
-            obj_posterior, obj_prior).mean()  # Mean over b+t
-
-        frame_prior = D.Independent(D.Normal(
-            torch.zeros_like(frame_posterior.base_dist.loc),
-            torch.ones_like(frame_posterior.base_dist.scale),
-        ), 1)
-        frame_kl = D.kl.kl_divergence(
-            frame_posterior, frame_prior).mean()  # Mean over b+t
-
-        loss = self.recon_alpha * nll + self.obj_kl_beta * \
-            object_kl + self.frame_kl_beta * frame_kl
+        loss = (
+            self.recon_alpha * pixel_likelihood
+            + self.obj_kl_beta * obj_latent_loss
+            + self.frame_kl_beta * frame_latent_loss
+        )
 
         return {
             "loss/total": loss,
-            "loss/nll": nll,
-            "loss/frame_kl": frame_kl,
-            "loss/obj_kl": object_kl,
-            "recon": x_recon,
-            "masks": x_masks,
-            "recon_full": x_recon_full
+            "loss/nll": pixel_likelihood,
+            "loss/frame_kl": frame_latent_loss,
+            "loss/obj_kl": obj_latent_loss,
+            "weights": weights,
+            "recon": weighted_pixels,
+            "masks": weights_softmax,
         }
 
-    def kld(self, mu, logvar):
-        return torch.mean(-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+    def pixel_likelihood_loss(self, pixels, video, weights):
+        b, t, k, h, w, c = pixels.shape
+        assert video.shape == (b, t, c, h, w)
+        target = E.repeat(video, "b t c h w -> b t k h w c", k=k)
+        log_prob = D.normal.Normal(pixels, self.pixel_std).log_prob(target)
+
+        pixel_probs = torch.exp(log_prob) * weights.unsqueeze(-1)
+        pixel_probs = pixel_probs.sum(dim=2)
+        assert pixel_probs.shape == (b, t, h, w, c)
+        pixel_likelihood = (
+            -1 / (t * h * w) * torch.log(pixel_probs).sum(dim=(4, 3, 2, 1))
+        )
+        assert pixel_likelihood.shape == (b,)
+        return pixel_likelihood
+
+    def get_latent_dist(self, latent, log_scale_min=-10, log_scale_max=3):
+        """Convert the MLP output (with mean and log std) into a torch `Normal` distribution."""
+        means, log_scale = torch.split(latent, self.z_dim, -1)
+        # Clamp the minimum to keep latents from getting too far into the saturating region of the exp
+        # And the max because I noticed it exploding early in the training sometimes
+        log_scale = log_scale.clamp(min=log_scale_min, max=log_scale_max)
+        dist = D.normal.Normal(means, torch.exp(log_scale))
+        return dist
+
+    def latent_kl_loss(self, obj_latents, frame_latents):
+
+        b, k, c = obj_latents.shape
+        b, t, c = frame_latents.shape
+
+        obj_latent_dist = self.get_latent_dist(obj_latents)
+        frame_latent_dist = self.get_latent_dist(frame_latents)
+        latent_prior = D.normal.Normal(
+            torch.zeros(c // 2, device=obj_latents.device, dtype=obj_latents.dtype,),
+            scale=1,
+        )
+        obj_latent_loss = (1 / k) * D.kl.kl_divergence(obj_latent_dist, latent_prior)
+        # The KL doesn't reduce all the way because the distribution considers the batch size to be (batch, K, LATENT_CHANNELS)
+        obj_latent_loss = obj_latent_loss.sum(dim=(2, 1))
+        assert obj_latent_loss.shape == (b,)
+        frame_latent_loss = (1 / t) * D.kl.kl_divergence(
+            frame_latent_dist, latent_prior
+        )
+        frame_latent_loss = frame_latent_loss.sum(dim=(2, 1))
+        assert frame_latent_loss.shape == (b,)
+
+        return obj_latent_loss, frame_latent_loss
 
 
 if __name__ == "__main__":

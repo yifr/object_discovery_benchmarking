@@ -1,4 +1,3 @@
-
 import torch
 import einops
 import numpy as np
@@ -7,9 +6,47 @@ import torch.nn.functional as F
 import torch.distributions as D
 
 
+class MLP(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        n_layers,
+        intermediate_size,
+        out_features,
+        nonlinearity=nn.ReLU,
+    ):
+        super(MLP, self).__init__()
+        self.in_features = in_features
+        self.n_layers = n_layers
+        self.out_features = out_features
+        self.nonlinearity = nonlinearity
+        layers = []
+        for i in range(n_layers):
+            if i == 0:
+                layer = nn.Linear(in_features, intermediate_size)
+            elif i == (n_layers - 1):
+                layer = nn.Linear(intermediate_size, out_features)
+            else:
+                layer = nn.Linear(intermediate_size, intermediate_size)
+
+            layers.append(layer)
+            layers.append(nonlinearity())
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
 def ConvNet(
-    num_layers, in_channels, mid_channels, out_channels, kernel=4, stride=2, padding=1,
-    dim=2
+    num_layers,
+    in_channels,
+    mid_channels,
+    out_channels,
+    kernel=4,
+    stride=2,
+    padding=1,
+    dim=2,
 ):
     """
     :param num_layers: (int) number of layers in network
@@ -99,8 +136,7 @@ class PositionalEncoding3D(nn.Module):
         if channels % 2:
             channels += 1
         self.channels = channels
-        inv_freq = 1.0 / \
-            (10000 ** (torch.arange(0, channels, 2).float() / channels))
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, channels, 2).float() / channels))
         self.register_buffer("inv_freq", inv_freq)
 
     def forward(self, tensor):
@@ -111,12 +147,9 @@ class PositionalEncoding3D(nn.Module):
         if len(tensor.shape) != 5:
             raise RuntimeError("The input tensor has to be 5d!")
         batch_size, x, y, z, orig_ch = tensor.shape
-        pos_x = torch.arange(x, device=tensor.device).type(
-            self.inv_freq.type())
-        pos_y = torch.arange(y, device=tensor.device).type(
-            self.inv_freq.type())
-        pos_z = torch.arange(z, device=tensor.device).type(
-            self.inv_freq.type())
+        pos_x = torch.arange(x, device=tensor.device).type(self.inv_freq.type())
+        pos_y = torch.arange(y, device=tensor.device).type(self.inv_freq.type())
+        pos_z = torch.arange(z, device=tensor.device).type(self.inv_freq.type())
         sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq)
         sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq)
         sin_inp_z = torch.einsum("i,j->ij", pos_z, self.inv_freq)
@@ -125,14 +158,13 @@ class PositionalEncoding3D(nn.Module):
             .unsqueeze(1)
             .unsqueeze(1)
         )
-        emb_y = torch.cat((sin_inp_y.sin(), sin_inp_y.cos()),
-                          dim=-1).unsqueeze(1)
+        emb_y = torch.cat((sin_inp_y.sin(), sin_inp_y.cos()), dim=-1).unsqueeze(1)
         emb_z = torch.cat((sin_inp_z.sin(), sin_inp_z.cos()), dim=-1)
         emb = torch.zeros((x, y, z, self.channels * 3), device=tensor.device).type(
             tensor.type()
         )
         emb[:, :, :, : self.channels] = emb_x
-        emb[:, :, :, self.channels: 2 * self.channels] = emb_y
-        emb[:, :, :, 2 * self.channels:] = emb_z
+        emb[:, :, :, self.channels : 2 * self.channels] = emb_y
+        emb[:, :, :, 2 * self.channels :] = emb_z
 
         return emb[None, :, :, :, :orig_ch].repeat(batch_size, 1, 1, 1, 1)
