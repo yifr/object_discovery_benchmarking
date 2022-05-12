@@ -8,6 +8,12 @@ import torch.nn.functional as F
 import torch.distributions as D
 
 
+def MultivariateNormal(loc, scale):
+    return torch.distributions.independent.Independent(
+        torch.distributions.normal.Normal(loc, scale), 1
+    )
+
+
 class Encoder(nn.Module):
     """
     Outputs frame encoding for each frame in a batch (B, T, H, W, C)
@@ -15,7 +21,7 @@ class Encoder(nn.Module):
     temporal order before getting sent through transformer blocks.
     """
 
-    def __init__(self, input_size, num_slots=16, z_dim=32, feature_dim=128):
+    def __init__(self, input_size, num_slots=16, z_dim=32, feature_dim=64):
         super(Encoder, self).__init__()
         b, t, c, h, w = input_size
         self.num_slots = num_slots
@@ -87,8 +93,8 @@ class Encoder(nn.Module):
             z, "b (t k) z_c -> b k t z_c", t=t, k=self.num_slots
         )  # NOTE: reverse K<->T
 
-        obj_mean = z.mean(dim=2)  # object mean is taken across frames
-        frame_mean = z.mean(dim=1)  # frame mean is taken across objects
+        obj_mean = z.mean(dim=1)  # object mean is taken across frames
+        frame_mean = z.mean(dim=2)  # frame mean is taken across objects
 
         obj_params = self.lambda_obj_mlp(obj_mean)
         frame_params = self.lambda_frame_mlp(frame_mean)
@@ -101,9 +107,8 @@ class SIMONE(nn.Module):
         self,
         input_size,
         K_slots=16,
-        z_dim=64,
         recon_alpha=0.2,
-        obj_kl_beta=1e-4,
+        obj_kl_beta=1e-5,
         frame_kl_beta=1e-4,
         pixel_std=0.08,
         device="cuda",
@@ -193,8 +198,8 @@ class SIMONE(nn.Module):
         # Keep channels last for ease of concatenating inputs
 
         # Construct spatial coordinate map
-        xs = torch.linspace(-1, 1, h)
-        ys = torch.linspace(-1, 1, w)
+        xs = torch.linspace(-1, 1, h).to(self.device)
+        ys = torch.linspace(-1, 1, w).to(self.device)
         xb, yb = torch.meshgrid(xs, ys, indexing="ij")
         _coord_map = torch.stack([xb, yb])
         spatial_coords = E.repeat(
@@ -235,6 +240,12 @@ class SIMONE(nn.Module):
         return pixels, weights, weights_softmax, weighted_pixels
 
     def forward(self, x, decode_idxs=None):
+        """
+        Returns dictionary containing:
+            total loss, negative log likelihood, object and
+            frame KL divergences, as well as output masks,
+            pixel mixture distributions and the full reconstruction
+        """
         b, t, c, h, w = x.shape
         obj_posterior, frame_posterior, obj_latents, frame_latents = self.encode(x)
 
@@ -258,6 +269,7 @@ class SIMONE(nn.Module):
             + self.frame_kl_beta * frame_latent_loss
         )
 
+        loss = loss
         return {
             "loss/total": loss,
             "loss/nll": pixel_likelihood,
@@ -325,6 +337,6 @@ if __name__ == "__main__":
         optim.zero_grad()
         out = model(img)
         losses = model.compute_loss(img, out)
-        losses["total_loss"].backward()
-        print(losses["total_loss"].item())
+        losses["loss/total"].backward()
+        print(losses["loss/total"].item())
         optim.step()
