@@ -72,9 +72,10 @@ def train(args, model, data, step=0):
 
     writer = SummaryWriter(args.log_dir)
 
+    _batch = next(iter(data))
     def train_step(batch, model, optim):
         optim.zero_grad()
-        images = batch["images"].to(device)
+        images = _batch["images"].to(device)
         out = model(images)
         loss = out["loss/total"]
         loss.backward()
@@ -87,14 +88,15 @@ def train(args, model, data, step=0):
 
     model.train()
     while step < args.train_steps:
+        data.dataset.reset_iterator()
         for i, batch in enumerate(tqdm(data)):
-            #lr = learning_rate_update(
-            #    optim, step, args.warmup_steps, args.lr, args.train_steps
-            #)
+            lr = learning_rate_update(
+                optim, step, args.warmup_steps, args.lr, args.train_steps
+            )
             out = train_step(batch, model, optim)
             if i % args.log_every == 0:
-                recons = out["recon_full"].detach().cpu().numpy()
-                images = batch["images"].detach().cpu().numpy()
+                recons = out["recon"].detach().cpu().numpy()
+                images = _batch["images"].detach().cpu().numpy()
                 loss = out["loss/total"].item()
                 obj_kl_loss = out["loss/obj_kl"].item()
                 frame_kl_loss = out["loss/frame_kl"].item()
@@ -139,14 +141,14 @@ def train(args, model, data, step=0):
     return
 
 def main():
-    import gc
-    gc.collect()
+    import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU')
     torch.cuda.empty_cache()
     batch_size = 1
-    n_frames = 3
+    n_frames = 10
     model = SIMONe.SIMONE((batch_size, n_frames, 3, 64, 64)).to(device)
     #model = nn.DataParallel(model, device_ids=[0, 1])
-    dataloader = DataLoader(movi.MoviDataset("/om2/user/yyf/MOVI/movi_a/128x128/1.0.0",
+    dataloader = DataLoader(movi.MoviDataset("/om2/user/yyf/MOVI/movi_c/128x128/1.0.0",
                                              sequence_length = n_frames),
                             batch_size=batch_size)
     train(args, model, dataloader)

@@ -87,7 +87,7 @@ class MoviDataset(Dataset):
             split: str = 'train',
             sequence_length: int = 2,
             delta_time: int = 1,
-            passes: List[str] = ["images", "objects", "flow"],
+            passes: List[str] = ["images"],
             passes_dict: Dict[str, str] = PASSES_DICT,
             transform_dict: Dict[str, callable] = DEFAULT_TRANSFORMS,
             resize=None,

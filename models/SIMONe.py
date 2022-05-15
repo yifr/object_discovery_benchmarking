@@ -1,7 +1,7 @@
 import os
 import torch
 import einops as E
-import networks
+from models import networks
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +21,7 @@ class Encoder(nn.Module):
     temporal order before getting sent through transformer blocks.
     """
 
-    def __init__(self, input_size, num_slots=16, z_dim=32, feature_dim=64):
+    def __init__(self, input_size, num_slots=16, z_dim=32, feature_dim=128):
         super(Encoder, self).__init__()
         b, t, c, h, w = input_size
         self.num_slots = num_slots
@@ -33,7 +33,7 @@ class Encoder(nn.Module):
             num_layers,
             in_channels=c,
             mid_channels=feature_dim,
-            out_channels=feature_dim,
+            out_channels=128,
         )
 
         self.position_encoding_1 = networks.PositionalEncodingPermute3D(128)
@@ -93,8 +93,8 @@ class Encoder(nn.Module):
             z, "b (t k) z_c -> b k t z_c", t=t, k=self.num_slots
         )  # NOTE: reverse K<->T
 
-        obj_mean = z.mean(dim=1)  # object mean is taken across frames
-        frame_mean = z.mean(dim=2)  # frame mean is taken across objects
+        obj_mean = z.mean(dim=2)  # object mean is taken across frames
+        frame_mean = z.mean(dim=1)  # frame mean is taken across objects
 
         obj_params = self.lambda_obj_mlp(obj_mean)
         frame_params = self.lambda_frame_mlp(frame_mean)
@@ -107,9 +107,10 @@ class SIMONE(nn.Module):
         self,
         input_size,
         K_slots=16,
+        z_dim=64,
         recon_alpha=0.2,
         obj_kl_beta=1e-5,
-        frame_kl_beta=1e-4,
+        frame_kl_beta=1e-5,
         pixel_std=0.08,
         device="cuda",
     ):
@@ -126,7 +127,7 @@ class SIMONE(nn.Module):
 
         self.K_slots = K_slots
         self.z_dim = z_dim
-        self.encoder = Encoder(input_size, z_dim=z_dim)
+        self.encoder = Encoder(input_size)
         self.decoder = networks.MLP(
             in_features=self.z_dim * 2 + 3,
             n_layers=3,
@@ -209,7 +210,7 @@ class SIMONE(nn.Module):
         # Construct temporal map
         temporal_coords = E.repeat(
             torch.arange(0, t), "t -> b t k h w 1", b=b, k=self.K_slots, h=h, w=w
-        )
+        ).to(self.device)
 
         # inputs consist of concatenated object and frame latents as well as
         # a spatial coordinate map (ie; broadcast decoder) and temporal coordinates
@@ -269,12 +270,13 @@ class SIMONE(nn.Module):
             + self.frame_kl_beta * frame_latent_loss
         )
 
+        weighted_pixels = weighted_pixels.permute((0, 1, 4, 2, 3)) # Shape should be B, T, C, H, W
         loss = loss
         return {
             "loss/total": loss,
-            "loss/nll": pixel_likelihood,
-            "loss/frame_kl": frame_latent_loss,
-            "loss/obj_kl": obj_latent_loss,
+            "loss/nll": pixel_likelihood * self.recon_alpha,
+            "loss/frame_kl": frame_latent_loss * self.frame_kl_beta,
+            "loss/obj_kl": obj_latent_loss * self.obj_kl_beta,
             "weights": weights,
             "recon": weighted_pixels,
             "masks": weights_softmax,
@@ -295,7 +297,7 @@ class SIMONE(nn.Module):
         assert pixel_likelihood.shape == (b,)
         return pixel_likelihood
 
-    def get_latent_dist(self, latent, log_scale_min=-10, log_scale_max=3):
+    def get_latent_dist(self, latent, log_scale_min=-10, log_scale_max=10):
         """Convert the MLP output (with mean and log std) into a torch `Normal` distribution."""
         means, log_scale = torch.split(latent, self.z_dim, -1)
         # Clamp the minimum to keep latents from getting too far into the saturating region of the exp
@@ -308,7 +310,6 @@ class SIMONE(nn.Module):
 
         b, k, c = obj_latents.shape
         b, t, c = frame_latents.shape
-
         obj_latent_dist = self.get_latent_dist(obj_latents)
         frame_latent_dist = self.get_latent_dist(frame_latents)
         latent_prior = D.normal.Normal(
@@ -316,7 +317,6 @@ class SIMONE(nn.Module):
             scale=1,
         )
         obj_latent_loss = (1 / k) * D.kl.kl_divergence(obj_latent_dist, latent_prior)
-        # The KL doesn't reduce all the way because the distribution considers the batch size to be (batch, K, LATENT_CHANNELS)
         obj_latent_loss = obj_latent_loss.sum(dim=(2, 1))
         assert obj_latent_loss.shape == (b,)
         frame_latent_loss = (1 / t) * D.kl.kl_divergence(
