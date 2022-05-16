@@ -156,8 +156,14 @@ def train(args, model, data, rank, step=0):
 
 
 def setup(rank, world_size):
+    import socket
+    sock = socket.socket()
+    sock.bind(('', 0))
+    socketname = sock.getsockname()[1]
+    sock.close()
+
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    os.environ['MASTER_PORT'] = str(socketname)
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
